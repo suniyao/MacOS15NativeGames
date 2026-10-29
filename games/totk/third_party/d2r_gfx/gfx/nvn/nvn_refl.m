@@ -41,6 +41,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         for (NSDictionary *b in bs) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
+            r->count = 1;
             r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
             if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
@@ -55,6 +56,32 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"c1"]) r->kind = NVN_RB_C1;
             else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
             else FAIL("B 绑定种类 %s 未实现（%s）", k.UTF8String, [b[@"msl_name"] UTF8String]);
+            NSString *type = b[@"msl_type"];
+            if ([type hasPrefix:@"array<"]) {
+                NSRange comma = [type rangeOfString:@"," options:NSBackwardsSearch];
+                if (comma.location == NSNotFound || ![type hasSuffix:@">"]) FAIL("Malformed resource array");
+                NSString *length = [type substringWithRange:NSMakeRange(comma.location+1, type.length-comma.location-2)];
+                NSScanner *scanner = [NSScanner scannerWithString:length]; int count;
+                if (![scanner scanInt:&count] || !scanner.isAtEnd || count < 1 || count > NVN_REFL_MAXS) FAIL("Invalid resource array length");
+                r->count = (uint16_t)count;
+                type = [type substringWithRange:NSMakeRange(6, comma.location-6)];
+                dummy_kind(type, &r->dtt, &r->dpf);
+            }
+            if (aid < 0 || aid >= NVN_REFL_MAXS || r->count > NVN_REFL_MAXS-aid) FAIL("Argument resource range exceeds capacity");
+            for (int previous=0; previous<o->nb; previous++) {
+                const nvn_rbind *q=&o->b[previous];
+                if (aid < q->aid+q->count && q->aid < aid+r->count) FAIL("Overlapping argument resources");
+            }
+            if (reg < 0 && (r->kind == NVN_RB_TEX || r->kind == NVN_RB_SAMPT)) {
+                const char *name = [b[@"msl_name"] UTF8String];
+                const char *cb = name ? strstr(name, "_cb") : NULL;
+                unsigned bank, word; int consumed=0;
+                if (!cb || sscanf(cb,"_cb%u_%x%n",&bank,&word,&consumed)!=2 ||
+                    (cb[consumed] && strcmp(cb+consumed,"Smplr")) || bank<3 || bank>18 || word>16383)
+                    FAIL("Unsupported uniform texture name: %s", name ? name : "?");
+                r->kind = r->kind == NVN_RB_TEX ? NVN_RB_TEXU : NVN_RB_SAMPU;
+                r->reg = (uint16_t)(bank-3); r->off = (uint16_t)(word*4);
+            } else if (r->count != 1) FAIL("Unsupported resource array source");
             if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU) && reg < 0)
                 FAIL("B 绑定 %s 没解出槽号", [b[@"msl_name"] UTF8String]);
             o->nb++;

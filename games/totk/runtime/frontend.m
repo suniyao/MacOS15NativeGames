@@ -8,6 +8,9 @@
 #include <math.h>
 #include "runtime.h"
 #include "game_version.h"
+#ifndef NATIVE_GAME_TITLE
+#define NATIVE_GAME_TITLE "Tears of the Kingdom"
+#endif
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
@@ -19,6 +22,7 @@ static _Atomic uint64_t presentedFrames;
 static _Atomic int warmPending;
 static CVDisplayLinkRef displayLink;
 static _Atomic int focused;
+static void text_focus_restore(void);
 static pthread_mutex_t vsyncLock=PTHREAD_MUTEX_INITIALIZER;
 static void *vsyncEvents[16];
 static unsigned vsyncCount;
@@ -92,6 +96,20 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
+-(void)nativePointer:(NSEvent *)event phase:(int)phase{
+ extern void runtime_title_pointer(int,double,double) __attribute__((weak_import));
+ if(!runtime_title_pointer)return;
+ NSPoint p=[self convertPoint:event.locationInWindow fromView:nil];
+ double w=self.bounds.size.width,h=self.bounds.size.height;
+ double scale=fmin(w/1280.0,h/720.0),left=(w-1280*scale)/2,top=(h-720*scale)/2;
+ if(scale<=0)return;
+ double x=(p.x-left)/(1280*scale),y=(h-p.y-top)/(720*scale);
+ if(phase==0&&(x<0||x>1||y<0||y>1))return;
+ runtime_title_pointer(phase,x,y);
+}
+-(void)mouseDown:(NSEvent *)e{[self nativePointer:e phase:0];}
+-(void)mouseDragged:(NSEvent *)e{[self nativePointer:e phase:1];}
+-(void)mouseUp:(NSEvent *)e{[self nativePointer:e phase:2];}
 -(void)keyDown:(NSEvent *)e{runtime_input_key(e.keyCode,1);}
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 -(void)flagsChanged:(NSEvent *)e{if(e.keyCode==56)runtime_input_key(56,!!(e.modifierFlags&NSEventModifierFlagShift));if(e.keyCode==58)runtime_input_key(58,!!(e.modifierFlags&NSEventModifierFlagOption));}
@@ -112,17 +130,21 @@ static void front_sync_drawable(void){
 }
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end
+static int front_storage_busy(void) {
+ extern int runtime_title_exit_busy(void) __attribute__((weak_import));
+ return runtime_fs_save_busy()||(runtime_title_exit_busy&&runtime_title_exit_busy());
+}
 @implementation TOTKWindowDelegate
--(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);runtime_oe_push_message(15);fprintf(stderr,"[totk] window gained focus\n");}
--(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
+-(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);text_focus_restore();runtime_oe_push_message(15);fprintf(stderr,"[totk] window gained focus\n");}
+-(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);runtime_input_clear();extern void runtime_title_pointer(int,double,double) __attribute__((weak_import));if(runtime_title_pointer)runtime_title_pointer(3,0,0);runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
 /* The process ends with the window. Save writes go straight to the files (runtime/fs_host.c), so a close in the middle of a
    save waits (up to 15 s, the window already gone) until the game has written and committed it (runtime_fs_save_busy). */
 -(void)windowWillClose:(NSNotification *)n{(void)n;
- if(!runtime_fs_save_busy()){fprintf(stderr,"[totk] window closed; graceful guest shutdown pending\n");_exit(0);}
+ if(!front_storage_busy()){fprintf(stderr,"[totk] window closed; graceful guest shutdown pending\n");_exit(0);}
  fprintf(stderr,"[totk] window closed while the game is saving: quitting when the save is done\n");
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
-  uint64_t t0=runtime_now_ns();while(runtime_fs_save_busy()&&runtime_now_ns()-t0<15000000000ull)usleep(20000);
-  fprintf(stderr,"[totk] save %s after %.2f s; quitting\n",runtime_fs_save_busy()?"still in progress (gave up)":"done",(runtime_now_ns()-t0)/1e9);_exit(0);});
+  uint64_t t0=runtime_now_ns();while(front_storage_busy()&&runtime_now_ns()-t0<15000000000ull)usleep(20000);
+  fprintf(stderr,"[totk] save %s after %.2f s; quitting\n",front_storage_busy()?"still in progress (gave up)":"done",(runtime_now_ns()-t0)/1e9);_exit(0);});
 }
 -(void)windowDidResize:(NSNotification *)n{(void)n;front_sync_drawable();}
 /* Whether any part of the window can be seen (TOTK, 2026-10-16 night): macOS stops the display link's callbacks for a
@@ -159,7 +181,7 @@ void runtime_front_run(void(*callback)(void)){
   window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
-  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@"测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭",owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:"代理测试"]:[NSString stringWithFormat:@"Tears of the Kingdom  Mac — Ver. %s",TOTK_GAME_VERSION];
+  window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@"测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭",owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:"代理测试"]:[NSString stringWithFormat:@"%s  Mac — Ver. %s",NATIVE_GAME_TITLE,TOTK_GAME_VERSION];
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
   if (true_full) { window.level=NSMainMenuWindowLevel+1; window.collectionBehavior=NSWindowCollectionBehaviorCanJoinAllSpaces|NSWindowCollectionBehaviorStationary|NSWindowCollectionBehaviorIgnoresCycle|NSWindowCollectionBehaviorFullScreenAuxiliary; }
   else window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
@@ -203,7 +225,9 @@ void runtime_front_run(void(*callback)(void)){
 @property(strong) NSTextField *field;
 @property int maxUnits,minUnits,digitsOnly;
 @property uint32_t disabled;
+@property(assign) void *requestContext;
 @property(copy) void(^done)(NSString *text);   /* nil: cancelled */
+@property(copy) void(^changed)(NSString *text);
 -(void)refilter;
 @end
 @implementation TOTKTextBar
@@ -224,6 +248,7 @@ void runtime_front_run(void(*callback)(void)){
   if(self.maxUnits>0&&t.length+sub.length>(NSUInteger)self.maxUnits){*stop=YES;return;}
   [t appendString:sub];}];
  if(![t isEqualToString:s]){self.field.stringValue=t;NSBeep();}
+ if(self.changed)self.changed(self.field.stringValue);
 }
 -(void)finish:(NSString *)text{void(^d)(NSString *)=self.done;self.done=nil;if(d)d(text);}
 -(BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)sel{
@@ -235,6 +260,15 @@ void runtime_front_run(void(*callback)(void)){
 }
 @end
 static __weak TOTKTextBar *openBar;   /* main thread only */
+static void text_focus_restore(void){
+ if(openBar && window.isKeyWindow && NSApp.isActive)[window makeFirstResponder:openBar.field];
+}
+void runtime_front_text_cancel(void *context){
+ dispatch_async(dispatch_get_main_queue(), ^{
+  TOTKTextBar *bar=openBar;
+  if(bar && bar.requestContext==context)[bar finish:nil];
+ });
+}
 void runtime_front_text_test(const char *op,const char *text){
  NSString *o=[NSString stringWithUTF8String:op],*t=[NSString stringWithUTF8String:text?text:""]?:@"";
  dispatch_async(dispatch_get_main_queue(), ^{
@@ -255,11 +289,14 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
  int maxU=req->max_units,minU=req->min_units,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
  __block NSString *result=nil;dispatch_semaphore_t sem=dispatch_semaphore_create(0);
  dispatch_async(dispatch_get_main_queue(), ^{
+  if(req->cancelled && req->cancelled(req->context)){dispatch_semaphore_signal(sem);return;}
   NSView *cv=window.contentView;CGFloat w=fmin(720,cv.bounds.size.width-40),h=104;
   TOTKTextBar *bar=[[TOTKTextBar alloc] initWithFrame:NSMakeRect(floor((cv.bounds.size.width-w)/2),48,w,h)];
   bar.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMaxYMargin;bar.wantsLayer=YES;bar.layer.cornerRadius=12;
   bar.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:0.92].CGColor;
-  bar.maxUnits=maxU;bar.minUnits=minU;bar.digitsOnly=digits;bar.disabled=dis;
+  bar.maxUnits=maxU;bar.minUnits=minU;bar.digitsOnly=digits;bar.disabled=dis;bar.requestContext=req->context;
+  if(req->changed){void(*changed)(const char*,void*)=req->changed;void *context=req->context;
+   bar.changed=^(NSString *text){changed(text.UTF8String,context);};}
   NSTextField *label=[NSTextField labelWithString:prompt];label.font=[NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
   label.textColor=NSColor.whiteColor;label.frame=NSMakeRect(18,h-36,w-36,22);label.lineBreakMode=NSLineBreakByTruncatingTail;
   NSString *limit=maxU>0?[NSString stringWithFormat:@"最多 %d 个字 · ",maxU]:@"";
@@ -269,12 +306,14 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
   NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)];
   field.font=[NSFont systemFontOfSize:20];field.stringValue=initial;field.delegate=bar;field.bezelStyle=NSTextFieldRoundedBezel;bar.field=field;
   __weak TOTKTextBar *weakBar=bar;
-  bar.done=^(NSString *text){result=[text copy];[weakBar removeFromSuperview];[window makeFirstResponder:window.contentView];dispatch_semaphore_signal(sem);};
+  bar.done=^(NSString *text){result=[text copy];TOTKTextBar *finished=weakBar;
+   if(openBar==finished){openBar=nil;if(window.firstResponder==finished.field || finished.field.currentEditor)[window makeFirstResponder:window.contentView];}
+   [finished removeFromSuperview];dispatch_semaphore_signal(sem);};
   [bar addSubview:label];[bar addSubview:hint];[bar addSubview:field];[cv addSubview:bar];openBar=bar;
   runtime_input_clear();
-  if(window.miniaturized)[window deminiaturize:nil];
-  if(!assume_focus()){[NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];}   /* test windows never take the keyboard */
-  [window makeFirstResponder:field];
+  /* A game callback may arrive while the user is in another app. Keep the
+     bar in this window, without activating, raising or restoring that window. */
+  if(!assume_focus())text_focus_restore();
   fprintf(stderr,"[totk] keyboard: text entry bar shown (%s)\n",prompt.UTF8String);
  });
  dispatch_semaphore_wait(sem,DISPATCH_TIME_FOREVER);

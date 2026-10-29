@@ -114,6 +114,11 @@ def execute(seed, patched, recursive=False, mutation=None, target=None, prefix_w
 
 
 class CallWindowTest(unittest.TestCase):
+    def test_tomodachi_register_move(self):
+        for seed in range(128):
+            with self.subTest(seed=seed):
+                self.assertEqual(execute(seed, False, prefix_word=0xaa1603e0),
+                                 execute(seed, True, prefix_word=0xaa1603e0))
     def test_v143_frame_pointer_load_and_store(self):
         for prefix_word in (0xf85e83a0, 0xb81f83af):
             for seed in range(64):
@@ -148,7 +153,7 @@ class CallWindowTest(unittest.TestCase):
                 self.assertNotEqual(execute(15, False), execute(15, True, mutation=mutation))
 
     def test_reject_unsafe_prefix(self):
-        for word in [0xD65F03C0, 0x910043FF, 0x58000000, 0xA9BF7BFD]:
+        for word in [0xD65F03C0, 0x910043FF, 0x58000000, 0xA9BF7BFD, 0xaa1203e0, 0xaa0003f2]:
             with self.subTest(word=word):
                 with self.assertRaises(ValueError):
                     prepare_call(word, OUTER, OUTER + 4, PATCH, KEYPAGE, 0)

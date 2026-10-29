@@ -34,6 +34,11 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 #include "../tex/nvn_bcdec.h"
 
 #include "nvn_dirty.h"
+#include "nvn_depth_clear.h"
+#include "nvn_mip_range.h"
+#if DM_NVN_M3
+#include "nvn_scaled_copy.h"
+#endif
 #include "nvn_refl.h"
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
@@ -605,9 +610,12 @@ void mtl_init(void) {
     }
     g_ev = [g_dev newSharedEvent];
     g_keep = [NSMutableArray array];
-    g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
+    const char *texture_upload=getenv("TOTK_TEXTURE_UPLOAD");
+    int cpu_upload=texture_upload && !strcmp(texture_upload,"cpu");
+    g_nvn_deswz_gpu = !cpu_upload && nvn_deswz_gpu_init(g_dev) == 0;
     dm_res_report_register(mtl_res_counts);
-    if (!g_nvn_deswz_gpu) MLOG("【红】显卡解排布初始化失败，预排布贴图回退 CPU");
+    if(cpu_upload)MLOG("[texture-upload] diagnostic CPU decoding selected; GPU decoding disabled");
+    else if (!g_nvn_deswz_gpu) MLOG("【红】显卡解排布初始化失败，预排布贴图回退 CPU");
     MLOG("Metal 设备 %s", g_dev.name.UTF8String);
     udc_selftest();
 }
@@ -2433,7 +2441,7 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
         if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
         unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1;
-        for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
+        for (unsigned l = 0; l < MIN(t->d.levels,mt.mipmapLevelCount) && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
         nvn_dirty_gpu_write_end(tok);
         if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
         else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
@@ -2528,6 +2536,15 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
         case 9: d.textureType = MTLTextureTypeCubeArray; d.arrayLength = t->d.depth; break;
         case 10: RED_ONCE(1, "缓冲贴图（TARGET_BUFFER）未实现"); return nil;
         default: d.textureType = MTLTextureType2D; break;
+    }
+    // NVN assets may advertise a fixed upper mip count (Tomodachi: 15 for
+    // 48x96). Metal permits only the chain down to 1x1. Keep guest layout
+    // offsets intact, but allocate/upload the physically representable chain.
+    NSUInteger extent=MAX(d.width,MAX(d.height,d.depth)), max_levels=1;
+    while (extent>1) { extent>>=1; max_levels++; }
+    if (d.mipmapLevelCount>max_levels) {
+        RED_ONCE(61,"NVN mip count %lu exceeds %lux%lux%lu chain; Metal uses %lu levels",(unsigned long)d.mipmapLevelCount,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)max_levels);
+        d.mipmapLevelCount=max_levels;
     }
     d.storageMode = MTLStorageModePrivate;   // 渲染目标与素材都放 GPU 私有存储（可用无损压缩） | Render targets and assets both go in GPU private storage (lossless compression available)
     d.usage = MTLTextureUsageShaderRead | (fmt_compressed(t->d.format) || packaged ? 0 : MTLTextureUsageRenderTarget)
@@ -3362,7 +3379,8 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
         if (pk) pk->used = g_sub_serial;
         /* TOTK: rendered into by the GPU since the upload: the pool memory is stale, never re-upload. The set only grows, so
            the answer is kept in the NvPkg and asked again only after it gained members (a locked lookup on every use before). */
-        int reduced = pk && pk->tex && (pk->tex.mipmapLevelCount < (t->d.levels ? t->d.levels : 1u) || (tc_pf(t->d.format) != MTLPixelFormatInvalid && pk->tex.pixelFormat == tc_pf(t->d.format)));   // TOTK: copy without its top level (mip_drop_of) or transcoded (tex_tc): not something the GPU can render into
+        unsigned full_mips=nvn_physical_mips(t->d.width,t->d.target==3?1:t->d.height,t->d.target==2?t->d.depth:1,t->d.levels);
+        int reduced = pk && pk->tex && (pk->tex.mipmapLevelCount < full_mips || (tc_pf(t->d.format) != MTLPixelFormatInvalid && pk->tex.pixelFormat == tc_pf(t->d.format)));   // top-mip drop or transcoding; a truncated repeated 1x1 tail is not a reduced copy
         if (pk && pk->owned && pk->tex && !reduced) return pk->tex;
         if (pk) {   // 已上传：自上次检查后有过客体写才查覆盖页 | Already uploaded: check the covered pages only if there has been a guest write since the last check
             uint64_t now = nvn_dirty_now(), h = 0; int clean;
@@ -3943,8 +3961,8 @@ static int pf_block_compressed(NSUInteger pf) { return pf >= 130 && pf <= 222 &&
 // into an auxiliary texture of the view format sized in blocks; the blocks are copied to the compressed texture
 // through a buffer when the pass ends (and copied back first when the pass loads the old contents).
 int nvn_fmt_bpb(int format, int *bw, int *bh);
-static NSMutableDictionary<NSNumber *, id<MTLTexture>> *g_blkaux;
-typedef struct { __unsafe_unretained id<MTLTexture> aux, dst; NSUInteger level, slice, plane, lw, lh, bx, by, bpb; int decode, fmt; } blk_wb;   // plane: 3D depth plane
+static NSMutableDictionary<NSString *, id<MTLTexture>> *g_blkaux;
+typedef struct { __unsafe_unretained id<MTLTexture> aux, dst; NSUInteger level, slice, plane, lw, lh, bx, by, bpb; int decode, fmt, per_level; } blk_wb;   // plane: 3D depth plane
 static blk_wb g_blk_wb[8]; static int g_nblk_wb;
 /* GPUs without BC (A15/A16): the compressed texture exists only decompressed (bc_unpack), so the rendered blocks are
    decoded into it with the upload decoder (bcd) instead of being copied. The auxiliary block texture is kept per texture
@@ -3963,7 +3981,7 @@ static void blk_transcode(id<MTLTexture> aux, const blk_wb *w) {
     id<MTLBuffer> pb; size_t po = arena_alloc(32, &pb);
     uint32_t *pp = (uint32_t *)((uint8_t *)pb.contents + po); pp[0] = 0; pp[1] = (uint32_t)row; pp[2] = (uint32_t)w->lw; pp[3] = (uint32_t)w->lh; pp[4] = (uint32_t)w->fmt; pp[5] = 0;
     id<MTL4ComputeCommandEncoder> e = blit();
-    enc_b_copy_texture_buffer(e, aux, w->slice, w->level, MTLOriginMake(0, 0, 0), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
+    enc_b_copy_texture_buffer(e, aux, w->slice, w->per_level ? 0 : w->level, MTLOriginMake(0, 0, 0), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
     ((void)0);
     m3_attach(at, e, M3_STAGE_COMPUTE); [e setComputePipelineState:ps];
     [at setAddress:b.gpuAddress atIndex:0]; [at setAddress:pb.gpuAddress + po atIndex:1]; [at setAddress:ab.gpuAddress atIndex:2];
@@ -3993,7 +4011,7 @@ static void blk_decode(id<MTLTexture> aux, const blk_wb *w) {
     id<MTLBuffer> pb; size_t po = arena_alloc(32, &pb);
     uint32_t *pp = (uint32_t *)((uint8_t *)pb.contents + po); pp[0] = 0; pp[1] = (uint32_t)row; pp[2] = (uint32_t)w->lw; pp[3] = (uint32_t)w->lh; pp[4] = (uint32_t)w->fmt; pp[5] = (uint32_t)w->plane;
     id<MTL4ComputeCommandEncoder> e = blit();
-    enc_b_copy_texture_buffer(e, aux, w->slice, w->level, MTLOriginMake(0, 0, w->plane), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
+    enc_b_copy_texture_buffer(e, aux, w->slice, w->per_level ? 0 : w->level, MTLOriginMake(0, 0, w->plane), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
     ((void)0);
     m3_attach(at, e, M3_STAGE_COMPUTE); [e setComputePipelineState:ps];
     [at setAddress:b.gpuAddress atIndex:0]; [at setAddress:pb.gpuAddress + po atIndex:1]; [at setTexture:v atIndex:0];
@@ -4010,9 +4028,9 @@ static void blk_copy(id<MTLTexture> from, int from_aux, id<MTLTexture> to, const
     res_add(b);
     id e = blit();
     MTLSize blocks = MTLSizeMake(w->bx, w->by, 1), texels = MTLSizeMake(w->lw, w->lh, 1);
-    enc_b_copy_texture_buffer(e, from, w->slice, w->level, MTLOriginMake(0, 0, w->plane), from_aux ? blocks : texels, b, 0, row, size);
+    enc_b_copy_texture_buffer(e, from, w->slice, from_aux && w->per_level ? 0 : w->level, MTLOriginMake(0, 0, w->plane), from_aux ? blocks : texels, b, 0, row, size);
     ((void)0);
-    enc_b_copy_buffer_texture(e, b, 0, row, size, from_aux ? texels : blocks, to, w->slice, w->level, MTLOriginMake(0, 0, w->plane));
+    enc_b_copy_buffer_texture(e, b, 0, row, size, from_aux ? texels : blocks, to, w->slice, !from_aux && w->per_level ? 0 : w->level, MTLOriginMake(0, 0, w->plane));
     defer_obj_release(b);
 }
 // Returns the auxiliary render texture for attachment i (nil when the attachment renders directly) and fills *w.
@@ -4028,22 +4046,24 @@ static id<MTLTexture> blk_aux(const tex_t *t, const view_t *v, int has_v, blk_wb
     int is3d = base.textureType == MTLTextureType3D;
     if (base.textureType != MTLTextureType2D && base.textureType != MTLTextureType2DArray && !is3d) MDIE("compressed render target of texture type %lu", (unsigned long)base.textureType);
     if (!g_blkaux) g_blkaux = [NSMutableDictionary dictionary];
-    NSNumber *key = @(t->serial); id<MTLTexture> a = g_blkaux[key];
-    NSUInteger aw = (base.width + bw - 1) / bw, ah = (base.height + bh - 1) / bh;
+    NSUInteger lv = v->set_levels ? v->base_level : 0, sl = v->set_layers ? v->min_layer : 0;
+    if (lv>=base.mipmapLevelCount) MDIE("Compressed render mip %lu outside base texture",(unsigned long)lv);
+    NSUInteger lw = MAX(base.width >> lv, 1u), lh = MAX(base.height >> lv, 1u);
+    // A compressed mip chain has extra 1-block levels after its block-sized
+    // view reaches 1x1. Give each mip its own auxiliary texture at level zero.
+    NSString *key = [NSString stringWithFormat:@"%llu/%lu",(unsigned long long)t->serial,(unsigned long)lv];
+    id<MTLTexture> a = g_blkaux[key];
+    NSUInteger aw=(lw+bw-1)/bw, ah=(lh+bh-1)/bh;
     if (!a || a.pixelFormat != vpf || a.width != aw || a.height != ah) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor new];
-        d.textureType = base.textureType; d.pixelFormat = (MTLPixelFormat)vpf; d.width = aw; d.height = ah;
-        d.arrayLength = base.arrayLength; d.depth = base.depth; d.mipmapLevelCount = base.mipmapLevelCount;
-        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        a = [g_dev newTextureWithDescriptor:d];
-        if (!a) MDIE("auxiliary block render texture %lux%lu", (unsigned long)aw, (unsigned long)ah);
-        res_add(a); g_blkaux[key] = a;
-        static int once; if (!once++) MLOG("[totk] rendering into compressed texture format %#x through view format %#x via a %lux%lu block texture", t->d.format, v->format, (unsigned long)aw, (unsigned long)ah);
+        d.textureType=base.textureType;d.pixelFormat=(MTLPixelFormat)vpf;d.width=aw;d.height=ah;
+        d.arrayLength=base.arrayLength;d.depth=MAX(base.depth>>lv,1u);d.mipmapLevelCount=1;
+        d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+        a=[g_dev newTextureWithDescriptor:d];
+        if(!a)MDIE("Auxiliary block render mip %lu texture %lux%lu",(unsigned long)lv,(unsigned long)aw,(unsigned long)ah);
+        res_add(a);g_blkaux[key]=a;
     }
-    NSUInteger lv = v->set_levels ? v->base_level : 0, sl = v->set_layers ? v->min_layer : 0;
-    NSUInteger lw = MAX(base.width >> lv, 1u), lh = MAX(base.height >> lv, 1u);
-    *w = (blk_wb){a, base, lv, is3d ? 0 : sl, is3d ? sl : 0, lw, lh, (lw + bw - 1) / bw, (lh + bh - 1) / bh, (NSUInteger)bpb, decode, decode == 2 ? bc1_rgba(t->d.format) : decode ? bcd_fmt(t->d.format) : 0};
-    if (w->bx > MAX(a.width >> lv, 1u) || w->by > MAX(a.height >> lv, 1u)) MDIE("compressed render target level %lu block size mismatch", (unsigned long)lv);
+    *w=(blk_wb){a,base,lv,is3d?0:sl,is3d?sl:0,lw,lh,aw,ah,(NSUInteger)bpb,decode,decode==2?bc1_rgba(t->d.format):decode?bcd_fmt(t->d.format):0,1};
     return a;
 }
 static id<MTLTexture> g_nt_watch; static void *g_nt_watch_ptr; static uint64_t g_nt_watch_ser;
@@ -4233,7 +4253,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
           static int ownlog = -1; if (ownlog < 0) ownlog = getenv("DM_NVN_OWNLOG") != NULL;
           if (ownlog && !was && tex_mirrored(ot)) MLOG("[ownlog] ser=%llu %ux%ux%u lv%u nvnfmt=%#x flags=%#x pool=%p pflags=%#x mem=%p off=%lld: GPU-rendered texture in a CPU-visible pool", (unsigned long long)ot->serial,
               ot->d.width, ot->d.height, ot->d.depth, ot->d.levels, ot->d.format, ot->d.flags, (void *)ot->pool, ot->pool ? ot->pool->flags : 0, (void *)ot->mem, (long long)ot->off); }
-        if (i < 8 && preaux[i]) { pd.colorAttachments[i].texture = preaux[i]; if (g_nblk_wb < 8) g_blk_wb[g_nblk_wb++] = pre[i]; }
+        if (i < 8 && preaux[i]) { pd.colorAttachments[i].texture = preaux[i]; if(pre[i].per_level)pd.colorAttachments[i].level=0; if (g_nblk_wb < 8) g_blk_wb[g_nblk_wb++] = pre[i]; }
         { MTLPixelFormat pf = pd.colorAttachments[i].texture.pixelFormat;   // TOTK: Metal cannot render to block-compressed formats
           if (pf_block_compressed(pf))
               MDIE("render target %d is block-compressed: NVN texture format %#x view %s format %#x, %ux%u, Metal format %lu", i, R.rt.color[i]->d.format,
@@ -4273,7 +4293,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         if (pd.depthAttachment.texture) {
             any = 1;
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
-            pd.depthAttachment.clearDepth = R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            pd.depthAttachment.clearDepth = pd.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(R.cd) : R.cd;
+            pd.depthAttachment.storeAction = MTLStoreActionStore;
             MTLPixelFormat pf = pd.depthAttachment.texture.pixelFormat;
             if (clear_only != 4 && (pf == MTLPixelFormatDepth32Float_Stencil8 || pf == MTLPixelFormatStencil8)) {   // 4：只挂深度 | 4: depth only
                 pd.stencilAttachment.texture = pd.depthAttachment.texture; pd.stencilAttachment.level = pd.depthAttachment.level;
@@ -4302,6 +4323,22 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         return nil;
     }
     if (lay_n) pd.renderTargetArrayLength = (NSUInteger)lay_n;
+    if(getenv("MTL_DEBUG_LAYER")){
+        static unsigned overlap_logs;
+        for(int i=0;i<R.rt.n;i++)for(int j=0;j<i;j++){
+            MTLRenderPassColorAttachmentDescriptor *a=pd.colorAttachments[i],*b=pd.colorAttachments[j];
+            id<MTLTexture> ar=a.texture,br=b.texture;
+            NSUInteger al=a.level,bl=b.level,as=a.slice,bs=b.slice;
+            while(ar.parentTexture){al+=ar.parentRelativeLevel;as+=ar.parentRelativeSlice;ar=ar.parentTexture;}
+            while(br.parentTexture){bl+=br.parentRelativeLevel;bs+=br.parentRelativeSlice;br=br.parentTexture;}
+            NSUInteger n=lay_n?lay_n:1;
+            if(ar && ar==br && al==bl && as<bs+n && bs<as+n && overlap_logs++<8)
+                MLOG("[attachment-overlap] frame=%llu pass=%llu c%d/c%d serial=%llu/%llu root=%p level=%lu slices=%lu/%lu count=%lu clear=%d/%d size=%lux%lu",
+                     (unsigned long long)atomic_load(&g_cur_frame),g_stat_pass+1,j,i,
+                     R.rt.color[j]->serial,R.rt.color[i]->serial,(__bridge void*)ar,al,bs,as,n,
+                     R.clear_c[j],R.clear_c[i],ar.width,ar.height);
+        }
+    }
     for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && zskip_zero_clear(i)) {
         g_zskip_cand_ok[i] = 1; g_zskip_cand[i] = (zskip_zero){R.rt.color[i]->serial, (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0), (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_layers ? R.rt.cview[i].min_layer : 0)};
     }
@@ -4787,7 +4824,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
         int max_aid = -1;
-        for (int i = 0; i < o->rf.nb; i++) max_aid = MAX(max_aid, o->rf.b[i].aid);
+        for (int i = 0; i < o->rf.nb; i++) max_aid = MAX(max_aid, o->rf.b[i].aid + o->rf.b[i].count - 1);
         o->arg_len = o->ae.encodedLength;
         if (o->arg_len != (NSUInteger)(8 * (max_aid + 1)) || (o->arg_len & 7))
             MDIE("着色器 %s 参数块布局异常：encodedLength=%lu maxAid=%d", o->key, (unsigned long)o->arg_len, max_aid);
@@ -5180,8 +5217,10 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
             sg = g_ser_gen;
         }
         NSUInteger l0 = r.v.set_levels ? r.v.base_level : 0, nl = r.v.set_levels && r.v.nlevels ? r.v.nlevels : base.mipmapLevelCount - l0;
-        { NSUInteger full = r.t.d.levels ? r.t.d.levels : 1;   // TOTK: a copy without its top level(s) (mip_drop_of): shift the view's level range
-          if (r.v.set_levels && base.mipmapLevelCount < full && tex_mirrored(&r.t)) { NSUInteger dl = full - base.mipmapLevelCount; l0 = l0 > dl ? l0 - dl : 0; if (l0 >= base.mipmapLevelCount) l0 = base.mipmapLevelCount - 1; nl = MIN(nl, base.mipmapLevelCount - l0); } }
+        { unsigned full=nvn_physical_mips(r.t.d.width,r.t.d.target==3?1:r.t.d.height,r.t.d.target==2?r.t.d.depth:1,r.t.d.levels);
+          unsigned first,length;
+          if (!nvn_mip_view_range(full,(unsigned)base.mipmapLevelCount,(unsigned)l0,r.v.set_levels?r.v.nlevels:0,&first,&length)) return nil;
+          l0=first;nl=length; }
         NSUInteger s0 = r.v.set_layers ? r.v.min_layer : 0;
         NSUInteger ns = base.textureType == MTLTextureType3D ? 1 : (r.v.set_layers && r.v.nlayers ? r.v.nlayers : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1) - s0);
         MTLTextureType tt = r.v.set_target ? ttype(r.v.target, base.textureType) : base.textureType;
@@ -6336,7 +6375,7 @@ static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy
 // useResource 在同一编码器内对同一（资源, 用法, 阶段）是幂等的：记下本渲染编码器已声明过的，重复的跳过（计算编码器每次派发新建，不去重）
 // useResource is idempotent for the same (resource, usage, stage) within one encoder: remember what this render encoder has already declared and skip repeats (a compute encoder is created anew for each dispatch, no dedup)
 static uint8_t g_args_dirty[6] = {1, 1, 1, 1, 1, 1};
-static uint64_t g_args_reg_seen, g_args_dirty_seen;
+static uint64_t g_args_reg_seen, g_args_dirty_seen, g_args_serial_seen, g_args_snapshot_seen;
 static uint64_t g_args_epoch[6] = {1, 1, 1, 1, 1, 1};
 static inline void args_dirty_stage(int stage) {
     g_args_dirty[stage] = 1;
@@ -6350,9 +6389,13 @@ static inline void args_program_changed(void) {
     memset(g_args_dirty, 1, sizeof g_args_dirty);
 }
 static inline void args_sync_dirty(void) {
-    uint64_t reg = g_reg_gen, dirty = nvn_dirty_now();
-    if (reg != g_args_reg_seen || dirty != g_args_dirty_seen) {
-        g_args_reg_seen = reg; g_args_dirty_seen = dirty; args_dirty_all();
+    uint64_t reg = g_reg_gen, dirty = nvn_dirty_now(), serial = g_ser_gen, snapshot = g_usnap_drops;
+    // Upstream #547: resource addresses can change without a new NVN binding.
+    if (reg != g_args_reg_seen || dirty != g_args_dirty_seen ||
+        serial != g_args_serial_seen || snapshot != g_args_snapshot_seen) {
+        g_args_reg_seen = reg; g_args_dirty_seen = dirty;
+        g_args_serial_seen = serial; g_args_snapshot_seen = snapshot;
+        args_dirty_all();
     }
 }
 static void bind_args(id<MTLCommandEncoder> en, int nvn_stage, int metal_vertex, id<MTLBuffer> ab, uint64_t gpu, size_t off, NSUInteger ai) {
@@ -6486,7 +6529,7 @@ static int arg_epoch_safe(NvShader *sh) {
         for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i];
             // Indirect pointers and writable bindings have replay-time side effects.
-            if (b->rw || b->kind == NVN_RB_IMG || b->kind == NVN_RB_SBUFU) { sh->ab_epoch_ok = -1; break; }
+            if (b->rw || b->kind == NVN_RB_IMG || b->kind == NVN_RB_SBUFU || b->kind == NVN_RB_TEXU || b->kind == NVN_RB_SAMPU || b->aid >= 64) { sh->ab_epoch_ok = -1; break; }
         }
     }
     return sh->ab_epoch_ok > 0;
@@ -6504,11 +6547,41 @@ static int tex_slots_diagnostics(void) {
     if (active < 0) active = getenv("DM_NVN_TEXPNG_FS") != NULL || getenv("DM_NVN_FLASHHDR") != NULL;
     return active;
 }
+#if DM_NVN_M3
+static void m3_indirect_use(id en, id original, MTLResourceUsage usage, int nvn_stage, int metal_vertex, uint64_t gpu) {
+    id resource = original;
+    if (!resource || ![resource conformsToProtocol:@protocol(MTLResource)]) return; // samplers are not resources
+    if ([resource conformsToProtocol:@protocol(MTLBuffer)]) {
+        // Uniform snapshots/renames can point at an arena rather than the original pool.
+        NSUInteger offset;
+        id<MTLBuffer> actual = m3_buf(gpu, &offset);
+        if (actual) resource = actual;
+    }
+    if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:resource usage:usage];
+    else {
+        MTLRenderStages stages = metal_vertex ? MTLRenderStageVertex : MTLRenderStageFragment;
+        if (rs_using(en)) rs_put((nvn_encode_packet){.op=RS_USE_RESOURCE,
+            .u={(uint64_t)(uintptr_t)CFBridgingRetain(resource),usage,stages}},0);
+        else [(id<MTLRenderCommandEncoder>)en useResource:resource usage:usage stages:stages];
+    }
+}
+#endif
+/* All consumers of an indirect texture binding must use the same submit-time
+   bytes, including preflight and render-target dependency checks. */
+static uint32_t uniform_texture_handle(const nvn_rbind *b,int stage,unsigned element) {
+    uint32_t handle=0;
+    const p_bind_buf *u=b->reg<16 && stage<6?&S.ubo[stage][b->reg]:NULL;
+    uint64_t offset=(uint64_t)b->off+(uint64_t)element*8;
+    if(u && u->addr && offset+4<=u->size)pend_materialize(u->addr+offset,(uint8_t *)&handle,4,0);
+    return handle;
+}
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     if (!sh->ae) return 1;
     if (nvn_stage == 1 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])
         g_flash_tonemap_target = tex_mtl(R.rt.color[0]);
-    uint64_t slots[NVN_REFL_MAXB] = {0};
+    uint64_t slots[NVN_REFL_MAXS] = {0};
+    int uniform_textures = 0;
+    for (int i=0;i<sh->rf.nb;i++) if (sh->rf.b[i].kind == NVN_RB_TEXU || sh->rf.b[i].kind == NVN_RB_SAMPU) uniform_textures=1;
     args_sync_dirty();
     static int ab_noreuse = -1; if (ab_noreuse < 0) ab_noreuse = getenv("DM_NVN_AB_NOREUSE") != NULL;   // TOTK diagnostic: never reuse a shader's argument buffer within a pass
     int epoch_mode = arg_epoch_on() && nvn_stage != 5 && arg_epoch_safe(sh);
@@ -6521,7 +6594,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
-    int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+    int reuse = !uniform_textures && !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
@@ -6532,7 +6605,12 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             return 1;
         }
     }
+#if DM_NVN_M3
+    // Residency alone does not tell Metal 3 about reads/writes through argument buffers.
+    #define USE(r, u) do { id resource_ = (r); m3_indirect_use(en, resource_, (u), nvn_stage, metal_vertex, slots[aid]); if (__builtin_expect(g_res_check_on, 0)) res_check(resource_, sh->key, reg); } while (0)
+#else
     #define USE(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
+#endif
     // DM_NVN_PASSDUMP：每通道每阶段第一次新编时记着色器键（K）与各绑定的实际来源（B：UBO 地址 / 长度 / 前 4 个浮点，贴图号与序号或「哑」）
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or 「哑」(dummy))
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
@@ -6597,6 +6675,36 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             }
             slots[aid] = gpu;
             USE((__bridge id<MTLBuffer>)mb, MTLResourceUsageRead);
+        } else if (b->kind == NVN_RB_TEXU || b->kind == NVN_RB_SAMPU) {
+            // Ryujinx BindlessToArray maps vec*2 + component/2: one handle every 8 bytes.
+            id last_texture_resource=nil;
+            for (unsigned element=0; element<b->count; element++) {
+                aid = b->aid + element;
+                uint32_t handle=uniform_texture_handle(b,nvn_stage,element);
+                if (bl) PD("I %llu st%d key=%s kind=%d cb=%u off=%u element=%u handle=%#x tid=%u sid=%u",
+                    g_stat_pass,nvn_stage,sh->key,b->kind,b->reg,b->off,element,handle,handle&0xfffff,handle>>20);
+                if (b->kind == NVN_RB_SAMPU) {
+                    unsigned sid=handle>>20;
+                    // Unused table records also contain ordinary material floats.
+                    // Resolve only registered samplers; samplers are not Metal
+                    // resources and do not need per-entry useResource calls.
+                    if(sid && sid<g_nsreg && g_sreg_ok[sid])samp_fast(sid);
+                    slots[aid]=sid && sid<g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
+                } else {
+                    unsigned tid=handle & 0xfffff; void *view=NULL;
+                    uint64_t rid=tid && tid<g_ntreg && g_treg[tid].ok ? tex_fast_rid(tid,&view) : 0;
+                    id<MTLTexture> texture=(__bridge id<MTLTexture>)view;
+                    if (!texture) { texture=dummy_tex(b->dtt,b->dpf); rid=g_dummy_tex_rid[b->dtt&7][b->dpf&3]; }
+                    else if (texture.textureType != b->dtt) {
+                        id<MTLTexture> adapted=tex_type_view(texture,(MTLTextureType)b->dtt);
+                        if (adapted) { texture=adapted; rid=adapted.gpuResourceID._impl; }
+                    }
+                    slots[aid]=rid;
+                    // Large sparse tables repeat dummy/identical resources.
+                    // One declaration covers consecutive entries of that resource.
+                    if(texture!=last_texture_resource){USE(texture,MTLResourceUsageRead);last_texture_resource=texture;}
+                }
+            }
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT：合并句柄（贴图号 | 采样器号 << 20）的采样器部分 | SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
             int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[nvn_stage][reg] : S.samp[nvn_stage][reg]) >> 20) : 0;
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
@@ -6754,6 +6862,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         return 1;
     }
     NSUInteger arg_len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
+    if (arg_len > sizeof slots) MDIE("Argument buffer exceeds resource capacity: %lu", (unsigned long)arg_len);
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy((uint8_t *)ab.contents + off, slots, arg_len);
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
@@ -7305,6 +7414,14 @@ static int draw_samples_rt(NvProg *pr) {   // 采样附件保持原ser级保守g
     if (!pr) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
+            if(b->kind==NVN_RB_TEXU){
+                for(unsigned element=0;element<b->count;element++){
+                    unsigned tid=uniform_texture_handle(b,st,element)&0xfffff;if(!tid)continue;
+                    registry_lock();uint64_t ser=tid<(unsigned)g_ntreg&&g_treg[tid].ok?g_treg[tid].t.serial:0;registry_unlock();
+                    for(int j=0;j<nr;j++)if(ser&&ser==rs[j])return 1;
+                }
+                continue;
+            }
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 && sh->stage < 6 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 && sh->stage < 6 ? S.tex[sh->stage][b->reg] : 0; else continue;
             int tid = (int)(h & 0xfffff); if (!tid) continue;
             registry_lock(); uint64_t ser = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; registry_unlock();
@@ -8457,6 +8574,9 @@ static void clear_ds_quad(const p_clear_ds *c) {
 static void prepare_draw_textures(NvProg *pr) {
     if (!pr) return;
     int planned = texture_plan_on();
+    /* The direct-slot plan cannot describe handles stored in uniforms. */
+    for(int st=0;st<2;st++)if(pr->sh[st])for(int i=0;i<pr->sh[st]->rf.nb;i++)
+        if(pr->sh[st]->rf.b[i].kind==NVN_RB_TEXU)planned=0;
     if (planned) {
         unsigned total = 0;
         for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
@@ -8483,6 +8603,13 @@ static void prepare_draw_textures(NvProg *pr) {
             for (int i = 0; i < count; i++) { int tid = 0;
                 if (planned) { unsigned slot = sh->texture_slots[i]; tid = (int)((slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128]) & 0xfffff); }
                 else { const nvn_rbind *b = &sh->rf.b[i];
+                    if(b->kind==NVN_RB_TEXU){
+                        for(unsigned element=0;element<b->count;element++){
+                            unsigned indirect=uniform_texture_handle(b,st,element)&0xfffff;
+                            if(indirect)(void)tex_fast(indirect);
+                            if(g_tex_prepare_split)break;
+                        }
+                    }
                     if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128) tid = (int)(S.tex[st][b->reg] & 0xfffff);
                     else if (b->kind == NVN_RB_IMG && b->reg < 32) tid = (int)(S.img[st][b->reg] & 0xfffff);
                 }
@@ -9833,6 +9960,18 @@ static void copy_t2t(const p_copy_t2t *c) {
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
     int s3 = c->src->d.target == 2, d3 = c->dst->d.target == 2, nz = c->sr.depth ? c->sr.depth : 1;
+#if DM_NVN_M3
+    if (!s3 && !d3 && c->sr.depth==c->dr.depth &&
+        (c->sr.width!=c->dr.width || c->sr.height!=c->dr.height) &&
+        !(c->flags & ~(NVN_COPY_FLAGS_ENGINE_2D_BIT|NVN_COPY_FLAGS_LINEAR_FILTER_BIT))) {
+        rp_end();blit_close();rs_sync();es_reset();
+        int ok=1;
+        for(int z=0;z<nz && ok;z++)ok=nvn_scaled_copy_encode(g_dev,g_cb,s,d,sl,sz0+c->sr.zoffset+z,dl,dz0+c->dr.zoffset+z,
+            c->sr.xoffset,c->sr.yoffset,c->sr.width,c->sr.height,c->dr.xoffset,c->dr.yoffset,c->dr.width,c->dr.height,c->flags&NVN_COPY_FLAGS_LINEAR_FILTER_BIT);
+        args_dirty_all();g_pso_dirty=g_dss_dirty=1;
+        if(ok){gpu_owned_mark(c->dst->serial);return;}
+    }
+#endif
     if (no_bc() && (s.pixelFormat == MTLPixelFormatASTC_4x4_LDR || s.pixelFormat == MTLPixelFormatASTC_4x4_sRGB) && (d.pixelFormat == MTLPixelFormatRGBA8Unorm || d.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB)
         && !s3 && !d3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height && (d.usage & MTLTextureUsageShaderWrite)) {   // 无 BC：ASTC 源 → 解压格式目标（见 copy_t2t_astc） | No BC: ASTC source -> decompressed-format destination (see copy_t2t_astc)
         int ok = 1;
@@ -9892,7 +10031,7 @@ static void clear_tex(const p_clear_tex *c) {
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : stencil ? rp.stencilAttachment : rp.colorAttachments[0];
         a.texture = t; a.level = lv; a.loadAction = MTLLoadActionClear; a.storeAction = MTLStoreActionStore;
         if (is3d) a.depthPlane = c->r.zoffset + z; else a.slice = l0 + c->r.zoffset + z;
-        if (depth) { rp.depthAttachment.clearDepth = c->c.f[0];
+        if (depth) { rp.depthAttachment.clearDepth = pf == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(c->c.f[0]) : c->c.f[0];
             if (stencil) { rp.stencilAttachment.texture = t; rp.stencilAttachment.level = lv; rp.stencilAttachment.slice = a.slice; rp.stencilAttachment.loadAction = MTLLoadActionClear;
                            rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = c->c.u[1]; } }
         else if (stencil) rp.stencilAttachment.clearStencil = c->c.u[0];
@@ -10226,7 +10365,21 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DISPATCH: dispatch(a); break;
-            case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+            case OP_BARRIER: {
+#if DM_NVN_M3
+                int32_t bits;memcpy(&bits,a,sizeof bits);
+                /* Automatic Metal 3 hazard tracking orders separate encoders;
+                   it does not make attachment writes visible to texture reads
+                   inside a continued render pass. Preserve explicit NVN edges. */
+                if(bits&(NVN_BARRIER_ORDER_PRIMITIVES_BIT|NVN_BARRIER_ORDER_FRAGMENTS_BIT|
+                         NVN_BARRIER_ORDER_INDIRECT_DATA_BIT|NVN_BARRIER_INVALIDATE_TEXTURE_BIT|
+                         NVN_BARRIER_INVALIDATE_SHADER_BIT)){
+                    rp_flush();blit_close();rs_sync();args_dirty_all();
+                }
+#endif
+                break;
+            }
+            case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
             default: break;
         }
         p += h.size;
@@ -11437,7 +11590,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         grab_buf = grab_w && grab_h ? [g_dev newBufferWithLength:grab_w * grab_h * 4 options:MTLResourceStorageModeShared] : nil;
         if (grab_buf) {
             res_add(grab_buf); res_commit();   // resident before this command buffer runs (lesson 55)
-            id<MTL4ComputeCommandEncoder> ge = [cb computeCommandEncoder];
+            id<MTL4ComputeCommandEncoder> ge = enc_b_begin(cb);
             ((void)0);
             [ge copyFromTexture:dr.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(grab_w, grab_h, 1)
                        toBuffer:grab_buf destinationOffset:0 destinationBytesPerRow:grab_w * 4 destinationBytesPerImage:grab_w * grab_h * 4];
@@ -11448,20 +11601,20 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (grab && grab_src && src.pixelFormat == MTLPixelFormatRGBA8Unorm) {
         src_buf = [g_dev newBufferWithLength:src_w * src_h * 4 options:MTLResourceStorageModeShared];
         if (src_buf) { res_add(src_buf); res_commit();
-            id<MTL4ComputeCommandEncoder> ge = [cb computeCommandEncoder];
+            id<MTL4ComputeCommandEncoder> ge = enc_b_begin(cb);
             ((void)0);
             [ge copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src_w, src_h, 1)
                        toBuffer:src_buf destinationOffset:0 destinationBytesPerRow:src_w * 4 destinationBytesPerImage:src_w * src_h * 4];
             m4_end(ge); }
     }
-    if (flash_guard_update) { id<MTL4ComputeCommandEncoder> be = [cb computeCommandEncoder];
+    if (flash_guard_update) { id<MTL4ComputeCommandEncoder> be = enc_b_begin(cb);
         ((void)0);
         [be copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:g_flash_guard_previous destinationSlice:0 destinationLevel:0 sliceCount:1 levelCount:1];
         m4_end(be); }
     int probe = interp < 0 && g_present_probe && src.width >= 128 && src.height >= 128 && dr.texture.width >= 128 && dr.texture.height >= 128 &&
         (src.pixelFormat == MTLPixelFormatBGRA8Unorm || src.pixelFormat == MTLPixelFormatRGBA8Unorm) && dr.texture.pixelFormat == MTLPixelFormatBGRA8Unorm;
     if (probe) {
-        id<MTL4ComputeCommandEncoder> b = [cb computeCommandEncoder];
+        id<MTL4ComputeCommandEncoder> b = enc_b_begin(cb);
         ((void)0);
         [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(src.width / 2 - 64, src.height / 2 - 64, 0)
             sourceSize:MTLSizeMake(128, 128, 1) toBuffer:g_present_probe_src[alloc_i] destinationOffset:0 destinationBytesPerRow:512 destinationBytesPerImage:65536];
@@ -12009,22 +12162,29 @@ int mtl_probe_blockrt(void) {
         {MTLTextureType2D, MTLPixelFormatBC4_RUnorm, MTLPixelFormatRGBA16Uint, 64, 32, 1, 8, 1, 0},
         {MTLTextureType3D, MTLPixelFormatBC4_RUnorm, MTLPixelFormatRGBA16Uint, 32, 32, 4, 8, 0, 2},
         {MTLTextureType2D, MTLPixelFormatBC3_RGBA, MTLPixelFormatRGBA32Uint, 32, 16, 1, 16, 0, 0},
+        {MTLTextureType2D, MTLPixelFormatBC4_RUnorm, MTLPixelFormatRGBA16Uint, 256, 256, 1, 8, 7, 0},
+        {MTLTextureType2D, MTLPixelFormatBC4_RUnorm, MTLPixelFormatRGBA16Uint, 256, 256, 1, 8, 8, 0},
     };
     for (unsigned c = 0; c < sizeof cases / sizeof *cases; c++) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor new];
         d.textureType = cases[c].type; d.pixelFormat = cases[c].bc; d.width = cases[c].w; d.height = cases[c].h; d.depth = cases[c].d;
         d.mipmapLevelCount = cases[c].level + 1; d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
         id<MTLTexture> bc = [g_dev newTextureWithDescriptor:d]; if (!bc) MDIE("probe compressed texture case %u", c); res_add(bc);
-        d.pixelFormat = cases[c].view; d.width = (cases[c].w + 3) / 4; d.height = (cases[c].h + 3) / 4; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        id<MTLTexture> aux = [g_dev newTextureWithDescriptor:d], aux2 = [g_dev newTextureWithDescriptor:d]; if (!aux || !aux2) MDIE("probe block texture case %u", c); res_add(aux); res_add(aux2);
-        NSUInteger lv = cases[c].level, lw = MAX(cases[c].w >> lv, 1u), lh = MAX(cases[c].h >> lv, 1u);
-        blk_wb w = {aux, bc, lv, 0, cases[c].plane, lw, lh, (lw + 3) / 4, (lh + 3) / 4, cases[c].bpb};
+        tex_t t={0};t.serial=0xfffff900+c;t.d.format=cases[c].bpb==8?NVN_FORMAT_RGTC1_UNORM:NVN_FORMAT_RGBA_DXT5;
+        t.d.target=cases[c].type==MTLTextureType3D?2:1;t.d.width=cases[c].w;t.d.height=cases[c].h;t.d.depth=cases[c].d;t.d.levels=cases[c].level+1;
+        serial_put(t.serial,bc);
+        view_t view={0};view.set_format=view.set_levels=view.set_layers=1;view.format=cases[c].bpb==8?NVN_FORMAT_RGBA16UI:NVN_FORMAT_RGBA32UI;view.base_level=cases[c].level;view.min_layer=cases[c].plane;
+        setenv("TOTK_GPU_BLOCKRT","1",1);
+        blk_wb w;id<MTLTexture> aux=blk_aux(&t,&view,1,&w);
+        d.pixelFormat=cases[c].view;d.width=w.bx;d.height=w.by;d.depth=MAX(cases[c].d>>cases[c].level,1u);d.mipmapLevelCount=1;d.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+        id<MTLTexture> aux2=[g_dev newTextureWithDescriptor:d];if(!aux||!aux2)MDIE("probe auxiliary texture");res_add(aux2);
+        NSUInteger lv=cases[c].level,lw=w.lw,lh=w.lh,al=0;
         NSUInteger row = w.bx * w.bpb, size = row * w.by;
         id<MTLBuffer> ref = probe_buf(size), rb1 = probe_buf(size), rb2 = probe_buf(size), rb3 = probe_buf(size);
         uint8_t *r = ref.contents; for (NSUInteger i = 0; i < size; i++) r[i] = (uint8_t)(i * 31 + c * 7 + 5);
         // 1. reference blocks -> block texture -> compressed texture -> buffer, and back into a second block texture
         mtl_sub_begin();
-        enc_b_copy_buffer_texture(blit(), ref, 0, row, size, MTLSizeMake(w.bx, w.by, 1), aux, 0, lv, MTLOriginMake(0, 0, w.plane));
+        enc_b_copy_buffer_texture(blit(), ref, 0, row, size, MTLSizeMake(w.bx, w.by, 1), aux, 0, al, MTLOriginMake(0, 0, w.plane));
         ((void)0);
         if (!getenv("TOTK_PROBE_NEGATIVE")) blk_copy(aux, 1, bc, &w);   /* negative control: the copy is left out */
         ((void)0);
@@ -12032,15 +12192,15 @@ int mtl_probe_blockrt(void) {
         blk_wb w2 = w; w2.aux = aux2;
         blk_copy(bc, 0, aux2, &w2);
         ((void)0);
-        enc_b_copy_texture_buffer(blit(), aux2, 0, lv, MTLOriginMake(0, 0, w.plane), MTLSizeMake(w.bx, w.by, 1), rb2, 0, row, size);
+        enc_b_copy_texture_buffer(blit(), aux2, 0, al, MTLOriginMake(0, 0, w.plane), MTLSizeMake(w.bx, w.by, 1), rb2, 0, row, size);
         // 2. a render pass clears the block texture (as a render target of the view format), then it goes to the compressed texture
         enc_b_end(g_blit); g_blit = nil;
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
-        rp.colorAttachments[0].texture = aux; rp.colorAttachments[0].level = lv;
+        rp.colorAttachments[0].texture = aux; rp.colorAttachments[0].level = al;
         if (cases[c].type == MTLTextureType3D) rp.colorAttachments[0].depthPlane = w.plane;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0x1234, 0x5678, 0x9abc, 0xdef0);
-        rp.renderTargetWidth = MAX(aux.width >> lv, 1u); rp.renderTargetHeight = MAX(aux.height >> lv, 1u);
+        rp.renderTargetWidth = MAX(aux.width >> al, 1u); rp.renderTargetHeight = MAX(aux.height >> al, 1u);
         id<MTL4RenderCommandEncoder> re = enc_r_begin(rp); enc_r_end(re);
         blk_copy(aux, 1, bc, &w);
         ((void)0);
@@ -12345,7 +12505,7 @@ int mtl_probe_upload_batch(void) {
    resolved view must retain every mip/layer written through the original storage descriptor. */
 int mtl_probe_storage_view(void) {
     mtl_init(); const NSUInteger W=16,H=16;int checked=0;
-    for(int test=0;test<6;test++) {
+    for(int test=0;test<10;test++) {
         int mode=test%2,kind=test/2,stage=test%2,reg=kind==2?31:127;
         NvProg *pr=[NvProg new];NvShader *sh=[NvShader new];pr->sh[stage]=sh;
         /* Exercise texture, typed-buffer and image dependency slots on both
@@ -12353,18 +12513,29 @@ int mtl_probe_storage_view(void) {
            storage upgrade and encoder split, not just the metadata list. */
         sh->rf.nb=2;sh->rf.b[0].kind=NVN_RB_CBUF;
         sh->rf.b[1].kind=kind==2?NVN_RB_IMG:kind==1?NVN_RB_TBUF:NVN_RB_TEX;sh->rf.b[1].reg=reg;
+        uint64_t handles[32]={0};
+        if(kind==3){sh->rf.b[1].kind=NVN_RB_TEXU;sh->rf.b[1].reg=0;sh->rf.b[1].count=8;sh->rf.b[1].off=8;handles[8]=1;}
         void *mem=calloc(1,4096);tex_t t={0};t.serial=0xffffffa0+mode*2;t.mem=mem;t.L.size=4096;
         t.d.width=W;t.d.height=H;t.d.depth=2;t.d.levels=2;t.d.target=4;t.d.format=0x25;
         tex_t alias=t;alias.serial++;if(!mode){alias.d.format=0x27;alias.d.flags=NVN_TEXTURE_FLAGS_IMAGE;}
         view_t view={0};view.set_format=1;view.format=0x27;
         mtl_reg_tex(1,&alias,mode?&view:NULL);
         id<MTLBuffer> rb=probe_buf(4096);op_hdr end={OP_END,8};mtl_sub_begin();mtl_exec((const uint8_t *)&end);
-        if(kind==2)S.img[stage][reg]=1;else S.tex[stage][reg]=1;
+        if(kind==3)S.ubo[stage][0]=(p_bind_buf){.stage=stage,.index=0,.addr=(uint64_t)(uintptr_t)handles,.size=sizeof handles};
+        else if(kind==2)S.img[stage][reg]=1;else S.tex[stage][reg]=1;
         for(int layer=0;layer<2;layer++)for(int level=0;level<2;level++) {
             memset(&R,0,sizeof R);R.has_rt=1;R.rt.n=1;R.rt.color[0]=&t;R.rt.has_cview[0]=1;
             view_t *v=&R.rt.cview[0];v->set_levels=v->set_layers=1;v->base_level=level;v->nlevels=1;v->min_layer=layer;v->nlayers=1;
             R.clear_c[0]=1;R.cc[0]=MTLClearColorMake((1+layer+2*level)/8.0,0.5,0.75,1);rp_begin();
             if(layer!=1||level!=1)rp_end();
+        }
+        if(kind==4){
+            struct {op_hdr barrier;int32_t bits,pad;op_hdr end;} ordered={{OP_BARRIER,16},NVN_BARRIER_ORDER_FRAGMENTS_BIT|NVN_BARRIER_INVALIDATE_TEXTURE_BIT,0,{OP_END,8}};
+            mtl_exec((const uint8_t *)&ordered);
+#if DM_NVN_M3
+            if(rp_active())MDIE("explicit texture barrier retained an active render encoder");
+#endif
+            checked++;
         }
         struct {op_hdr h;p_set_rt rt;op_hdr end;} future={{OP_SET_RT,8+sizeof(p_set_rt)},{0},{OP_END,8}};
         future.rt.n=1;future.rt.color[0]=&alias;
@@ -13222,8 +13393,10 @@ int mtl_probe_vertex_streams(void) {
    objects alternate with unchanged bindings, then UBO/storage/registry/serial
    changes invalidate them. Separate submissions/passes and snapshot retirement
    must also invalidate. Negative 18 ignores binding generations, 19 snapshots. */
+#include "nvn_args_invalidation_probe.h"
+
 int mtl_probe_arg_epoch(void) {
-    mtl_init(); int checked = 0;
+    mtl_init(); int checked = probe_args_invalidation();
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int negative = ne ? atoi(ne) : 0;
     const size_t size = 16384; void *mem = NULL;
     if (posix_memalign(&mem, size, size) || !mem) MDIE("argument epoch probe memory");
