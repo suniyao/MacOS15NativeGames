@@ -211,11 +211,12 @@ NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool
 // TOTK: logging switches checked on per-call paths (command memory, recording, submits) are read once.
 static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CMD_LOG") != NULL; return on; }
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
+static void guest_chain(const char *what);
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
-    if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { o->magic = 0; return 0; }
+    if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { guest_chain("memory pool initialization failed");o->magic = 0; return 0; }
     int gpu_visible = !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
     if (o->mem && gpu_visible) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem) LOG("【红】MemoryPoolInitialize 池没有存储 flags=%#x size=%#llx", o->flags, o->size);
@@ -255,7 +256,7 @@ NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b,ptrdiff_t off,size_t siz
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
+    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; LOG("[descriptor-pool] texture %p memory=%p offset=%lld count=%d",(void *)tp,(void *)p,(long long)off,n); mtl_set_tex_pool_n(n); return 1;
 }
 NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
 extern uint64_t g_frame_pub;
@@ -269,7 +270,7 @@ NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const
     mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
+    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; LOG("[descriptor-pool] sampler %p memory=%p offset=%lld count=%d",(void *)sp,(void *)p,(long long)off,n); return 1;
 }
 NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
 NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
@@ -1829,8 +1830,24 @@ static _Atomic uint64_t g_nvn_ns;   // 本帧在提交 / 出图里花的宿主�
 static pthread_mutex_t g_susp_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 static int g_susp, g_inflight_api;
-static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); }
-static void gfx_leave(void) { pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
+/* Titles that submit concurrently must serialize access to the renderer's
+   single encoding context. Synchronous replay consumes command memory before
+   returning to the game, so the game can immediately reuse that memory. */
+#if DM_NVN_SERIAL_REPLAY
+static pthread_mutex_t g_replay_mu=PTHREAD_MUTEX_INITIALIZER;
+#endif
+static void gfx_enter(void) {
+#if DM_NVN_SERIAL_REPLAY
+ pthread_mutex_lock(&g_replay_mu);
+#endif
+ pthread_mutex_lock(&g_susp_mu);while(g_susp)pthread_cond_wait(&g_susp_cv,&g_susp_mu);g_inflight_api++;pthread_mutex_unlock(&g_susp_mu);
+}
+static void gfx_leave(void) {
+ pthread_mutex_lock(&g_susp_mu);g_inflight_api--;pthread_cond_broadcast(&g_susp_cv);pthread_mutex_unlock(&g_susp_mu);
+#if DM_NVN_SERIAL_REPLAY
+ pthread_mutex_unlock(&g_replay_mu);
+#endif
+}
 void dm_gfx_suspend(int on) {
     pthread_mutex_lock(&g_susp_mu);
     g_susp = on != 0;

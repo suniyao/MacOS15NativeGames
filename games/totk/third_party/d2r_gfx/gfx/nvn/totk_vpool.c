@@ -39,7 +39,7 @@ int totk_vpool_init(pool_t *o) {
     if (virt && o->mem) { LOG("【红】vpool: virtual pool given storage %p", (void *)o->mem); return 0; }
     if (phys && !o->mem) { LOG("【红】vpool: physical pool without storage"); return 0; }
     if (phys && !(o->flags & F_CPU_NO_ACCESS)) {
-        if ((uintptr_t)o->mem % host_page()) { LOG("【红】vpool: CPU-visible physical pool %p not %#llx aligned; cannot alias", (void *)o->mem, host_page()); return 0; }
+        if ((uintptr_t)o->mem % host_page()) { LOG("【红】vpool: CPU-visible physical pool %p not %#llx aligned; cannot alias (size=%#llx flags=%#x)", (void *)o->mem, host_page(),o->size,o->flags); return 0; }
         return 1;   // aliases the game storage directly
     }
     o->span = round_up(o->size, host_page());

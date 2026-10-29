@@ -53,6 +53,7 @@ static int vibration_side(const uint32_t *h) {
     static _Atomic int warned; note_once(&warned, "vibration call with a handle this controller does not have; ignored", *h);
     return -1;
 }
+static _Atomic bool vibration_permitted = true;
 static void play(int side, const VibrationValue *v) {
     if (!v) runtime_fail("vibration value pointer");
     if (side < 0) return;
@@ -61,7 +62,7 @@ static void play(int side, const VibrationValue *v) {
     pthread_mutex_lock(&lastLock); last[side] = c; pthread_mutex_unlock(&lastLock); atomic_fetch_add(&values_in, 1);
     static _Atomic int first; if (!atomic_exchange(&first, 1)) fprintf(stderr, "[hid] first vibration value from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz\n",
                                                                          side ? "right" : "left", c.amp_low, c.freq_low, c.amp_high, c.freq_high);
-    if (atomic_load(&rumble_muted)) c.amp_low = c.amp_high = 0;
+    if (atomic_load(&rumble_muted) || !atomic_load(&vibration_permitted)) c.amp_low = c.amp_high = 0;
     runtime_rumble_set((unsigned)side, c.amp_low, c.freq_low, c.amp_high, c.freq_high);
 }
 static uint32_t vib_init(const uint32_t *h) {
@@ -86,7 +87,8 @@ static uint32_t vib_info(VibrationDeviceInfo *out, const uint32_t *h) {
     int side = vibration_side(h); *out = (VibrationDeviceInfo){side >= 0 ? 1u : 0u, side >= 0 ? (uint32_t)side + 1 : 0}; return 0;
 }
 static uint32_t vib_mounted(bool *out, const uint32_t *h) { if (!out) runtime_fail("vibration mounted pointer"); *out = vibration_side(h) >= 0; return 0; }
-static uint32_t vib_permitted(bool *out) { if (!out) runtime_fail("vibration permitted pointer"); *out = true; return 0; }
+static uint32_t vib_permit(bool permitted) { atomic_store(&vibration_permitted,permitted); if(!permitted) { runtime_rumble_set(0,0,160,0,320);runtime_rumble_set(1,0,160,0,320); } return 0; }
+static uint32_t vib_permitted(bool *out) { if (!out) runtime_fail("vibration permitted pointer"); *out = atomic_load(&vibration_permitted); return 0; }
 
 static void six_axis_check(const uint32_t *h) {
     if (!h) runtime_fail("six-axis handle pointer");
@@ -146,6 +148,7 @@ void *runtime_hid_feedback_override(const char *name) {
         {"_ZN2nn3hid6detail23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", (void *)vib_actual, false},
         {"_ZN2nn3hid6detail22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", (void *)vib_info, false},
         {"_ZN2nn3hid6detail24IsVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE", (void *)vib_mounted, false},
+        {"_ZN2nn3hid6detail15PermitVibrationEb", (void *)vib_permit, false},
         {"_ZN2nn3hid6detail20IsVibrationPermittedEPb", (void *)vib_permitted, false},
         {"_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_start, true},
         {"_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_stop, true},

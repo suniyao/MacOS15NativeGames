@@ -39,8 +39,9 @@ void runtime_hle_trace_set(int mode);                    /* hle_stack.c: 1 count
 void runtime_hle_describe(unsigned index, char *out, size_t cap);   /* hle_stack.c: readable name of a host-call wrapper */
 /* Text entry bar in the game window (runtime/frontend.m, Mac): the player types on the keyboard, Return confirms (1, the text
    as UTF-8 in out), Escape cancels (0). The caller waits; give the virtual core up around it (runtime_core_away). */
-typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; } RuntimeTextRequest;
+typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; void (*changed)(const char *,void *); void *context; int (*cancelled)(void *); } RuntimeTextRequest;
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size);
+void runtime_front_text_cancel(void *context); /* cancel only the bar owned by this request */
 void runtime_front_text_test(const char *op, const char *text);   /* diagnostics: "type" text, "enter", "esc" into the open bar */
 int runtime_core_away(void);          /* runtime/threads.c: a guest thread gives its virtual core up around a long host wait */
 void runtime_core_back(int *away);

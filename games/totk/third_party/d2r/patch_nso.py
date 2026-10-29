@@ -26,6 +26,7 @@ import lz4.block
 from capstone import *
 from call_window import BLR_X18, BLR_X30, prepare_call
 from relr import decode_relr
+from pc_relative import relocate_adrp
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 d = open(src, 'rb').read()
@@ -248,6 +249,8 @@ KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511, 'KRES0': 506, 'KRES1
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
 
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
+# A function may contain inline data behind a branch. Keep scanning later code.
+md.skipdata = True
 patch = bytearray(); fix = []; gates = []; stats = {}
 def stat(k): stats[k] = stats.get(k, 0) + 1
 def here(): return PATCH_OFF + len(patch)
@@ -539,8 +542,10 @@ def site_window_group(segments):
                 elif mnemonic in ('tbz', 'tbnz'): word = (word & 0xFFF8001F) | ((delta & 0x3FFF) << 5)
                 else: word = (word & 0xFF00001F) | ((delta & 0x7FFFF) << 5)
                 assert dis(word, here()).operands[-1].imm == destination
+            elif mnemonic == 'adrp':
+                word = relocate_adrp(word, ins.address, here())
             else:
-                assert mnemonic not in ('adr', 'adrp', 'bl', 'br', 'blr', 'ret') and not (mnemonic == 'ldr' and '[' not in ins.op_str)
+                assert mnemonic not in ('adr', 'adrp', 'bl', 'br', 'blr', 'ret') and not (mnemonic == 'ldr' and '[' not in ins.op_str), f'unsupported exclusive-window instruction {ins.address:x}: {mnemonic} {ins.op_str}'
             emit(word)
         emit(B(here(), copied.get(seg[-1].address + 4, exit_addresses[seg[-1].address + 4])))
     for target in exits:
@@ -573,6 +578,8 @@ def site_window(seg):
             if m in ('tbz', 'tbnz'): w = (w & 0xFFF8001F) | ((off & 0x3FFF) << 5)
             else: w = (w & 0xFF00001F) | ((off & 0x7FFFF) << 5)
             dd = dis(w, pc); assert dd.operands[-1].imm == newt and dd.mnemonic == m
+        elif m == 'adrp':
+            w = relocate_adrp(w, x.address, copy0 + 4 * k)
         else:
             assert m not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret') and not (m == 'ldr' and '[' not in x.op_str), hex(x.address)
         words.append(w)
@@ -607,16 +614,19 @@ starts = sorted(x for x in starts if x < TEXT_END)
 # ---- 线性扫描找全部改写点（不靠寄存器读写报告）----
 # ---- Linear scan to find all rewrite points (not relying on register read/write reports) ----
 kinds = {}
-for o in range(0, TEXT_END, 4):
-    w = struct.unpack_from('<I', IMG, o)[0]
-    if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
-    if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
-    if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
-    if w & 0xFFFFFFE0 == 0xD53BD060: kinds[o] = ('tpidrro_r', None); continue
-    if w & 0xFFFFFFE0 == 0xD53BE020: kinds[o] = ('cntpct', w & 31); continue
-    if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
-    for ins in md.disasm(IMG[o:o + 4], o):
-        if has18(ins): kinds[o] = ('x18', None)
+scan = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+scan.skipdata = True
+for chunk in range(0, TEXT_END, 65536):
+    for o, size, mnemonic, operands in scan.disasm_lite(bytes(IMG[chunk:min(chunk + 65536, TEXT_END)]), chunk):
+        assert size == 4, f'non-AArch64 instruction boundary {o:x}'
+        w = struct.unpack_from('<I', IMG, o)[0]
+        if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
+        if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
+        if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
+        if w & 0xFFFFFFE0 == 0xD53BD060: kinds[o] = ('tpidrro_r', None); continue
+        if w & 0xFFFFFFE0 == 0xD53BE020: kinds[o] = ('cntpct', w & 31); continue
+        if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
+        if re.search(r'\b[xw]18\b', operands): kinds[o] = ('x18', None)
 
 # 按函数取指令表，找窗口与跳转表
 # Take the instruction table per function, find the windows and jump tables
@@ -635,6 +645,8 @@ SIGNED_TABLES = {'277178b7dba1b6d4949a84778d4abc58': {
     0x5f2a9c: (0x5f2a90, 0x2d892e0, (884,892,16,900,-6516), 'f0030f2a12000010207ab0b85202008b40021fd6'),
     0x6397d8: (0x6397cc, 0x2d88e7c, (1376,1384,16,1392,1400,1408,-7264), 'fb0301aa12000010207ab0b85202008b40021fd6'),
 }}
+# Tomodachi 1.0.0: bounded signed tables; dispatch bytes and entries checked below.
+SIGNED_TABLES['56bf85bd535413464cb75bb6c2683b67'] = {203900: (203884, 44406264, (836, 272, 208, 20, 220, 824), '12000010227aa0b85202028b0001271e40021fd6'), 249452: (249440, 44406396, (496, 204, 216, 192, 268, 16), '410e40bd12000010217aa0b85202018b40021fd6')}
 funcs = sorted({func_of(a) for a, (k, _) in kinds.items() if k == 'x18'})
 for fa, fb in funcs:
     insl = list(md.disasm(bytes(IMG[fa:fb]), fa))

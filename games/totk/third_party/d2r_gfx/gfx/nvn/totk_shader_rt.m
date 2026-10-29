@@ -38,6 +38,8 @@ static _Atomic int64_t g_cached_variants = -1;
 
 static NSString *root_dir(void) {   // native-port/ (the executable lives in native-port/build/)
     if (g_root) return g_root;
+    const char *external = getenv("TOTK_NATIVE_ROOT");
+    if (external && *external) { g_root = [@(external) stringByResolvingSymlinksInPath]; return g_root; }
     char path[4096]; uint32_t n = sizeof path;
     if (_NSGetExecutablePath(path, &n)) die("executable path too long");
     g_root = [[[@(path) stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
@@ -156,7 +158,14 @@ NSString *totk_rt_variant(NSString *shader, int stage, const uint8_t *control, c
         NSString *msl = checked ? nil :
             [NSString stringWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", found]
                                              encoding:NSUTF8StringEncoding error:nil];
-        if (!checked && (!msl || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) {
+        /* Old bindless translations clamp every user-buffer lookup to entry 31.
+           Regenerate only variants containing those resource arrays; ordinary
+           shaders retain their cache. The translator now covers all 64 KiB. */
+        BOOL short_handles = NO;
+        if (!checked && msl) for (NSString *line in [msl componentsSeparatedByString:@"\n"])
+            if (([line containsString:@"array<texture"] || [line containsString:@"array<sampler"])
+                && [line containsString:@", 32>"]) { short_handles = YES; break; }
+        if (!checked && (!msl || short_handles || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) {
             [vs removeObjectAtIndex:i];  /* regenerate missing or previously un-compilable Metal variant */
             break;
         }

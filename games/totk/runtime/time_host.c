@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 typedef struct { int64_t value; uint8_t source[16]; } SteadyClockTimePoint;
 typedef struct { int64_t offset; SteadyClockTimePoint point; } SystemClockContext;
@@ -94,18 +95,78 @@ static int64_t user_difference(const ClockSnapshot *a, const ClockSnapshot *b) {
     if (memcmp(a->user.point.source, b->user.point.source, 16)) return 0;
     return (b->user.offset - a->user.offset) * 1000000000LL;
 }
+static void adjustable_adjust(void) { /* The adjustable clock follows macOS wall time. */ }
+static unsigned clock_context(SystemClockContext *out) {
+ if(!out)return R_INVALID;SteadyClockTimePoint point=steady_now();
+ *out=(SystemClockContext){posix_now()-point.value,point};return 0;
+}
+static unsigned device_location(char *out){if(!out)return R_INVALID;location_name(out);return 0;}
+typedef struct {char magic[8],name[0x24];} HostZoneRule;
+static CFTimeZoneRef rule_zone(const HostZoneRule *rule){
+ if(!rule||memcmp(rule->magic,"MNGTZ001",8)||!memchr(rule->name,0,sizeof rule->name))return NULL;
+ CFStringRef name=CFStringCreateWithCString(NULL,rule->name,kCFStringEncodingUTF8);
+ if(!name)return NULL;CFTimeZoneRef zone=CFTimeZoneCreateWithName(NULL,name,false);CFRelease(name);return zone;
+}
+static unsigned load_zone_rule(void *output,const char *location){
+ if(!output||!location||!memchr(location,0,0x24))return R_INVALID;
+ HostZoneRule rule={0};memcpy(rule.magic,"MNGTZ001",8);strcpy(rule.name,location);
+ CFTimeZoneRef zone=rule_zone(&rule);if(!zone)return R_INVALID;CFRelease(zone);
+ memset(output,0,0x4000);memcpy(output,&rule,sizeof rule);return 0;
+}
+static unsigned calendar_with_rule(CalendarTime *calendar,CalendarAdditionalInfo *info,const int64_t *posix,const HostZoneRule *rule){
+ if(!calendar||!posix)return R_INVALID;CFTimeZoneRef zone=rule_zone(rule);if(!zone)return R_INVALID;
+ CFAbsoluteTime absolute=(double)*posix-kCFAbsoluteTimeIntervalSince1970;
+ int32_t offset=(int32_t)CFTimeZoneGetSecondsFromGMT(zone,absolute);
+ fill_calendar(calendar,info,*posix+offset,0);
+ if(info){
+  info->utc_offset=offset;info->dst=CFTimeZoneIsDaylightSavingTime(zone,absolute);
+  CFStringRef abbreviation=CFTimeZoneCopyAbbreviation(zone,absolute);
+  if(abbreviation){CFStringGetCString(abbreviation,info->name,sizeof info->name,kCFStringEncodingUTF8);CFRelease(abbreviation);}
+ }
+ CFRelease(zone);return 0;
+}
+static unsigned posix_with_rule(int *count,int64_t *out,int capacity,const CalendarTime *calendar,const HostZoneRule *rule){
+ if(!count||!out||capacity<1||!calendar)return R_INVALID;
+ CFTimeZoneRef zone=rule_zone(rule);if(!zone)return R_INVALID;
+ int64_t naive=to_posix_utc(calendar);int n=0;
+ for(int day=-2;day<=2;day++){
+  CFAbsoluteTime when=(double)(naive+day*86400)-kCFAbsoluteTimeIntervalSince1970;
+  int64_t candidate=naive-(int64_t)CFTimeZoneGetSecondsFromGMT(zone,when);
+  CalendarTime check;unsigned result=calendar_with_rule(&check,NULL,&candidate,rule);
+  if(result||memcmp(&check,calendar,7))continue;
+  int duplicate=0;for(int i=0;i<n;i++)if(out[i]==candidate)duplicate=1;
+  if(!duplicate&&n<capacity)out[n++]=candidate;
+ }
+ CFRelease(zone);*count=n;return 0;
+}
+static SystemClockContext snapshot_context(const ClockSnapshot *s){return s->user;}
+static int64_t snapshot_posix(const ClockSnapshot *s){return s->user_time;}
+static CalendarTime snapshot_calendar(const ClockSnapshot *s){return s->user_calendar;}
 
 void *runtime_time_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn4time10InitializeEv", initialize}, {"_ZN2nn4time8FinalizeEv", finalize}, {"_ZN2nn4time13IsInitializedEv", is_initialized},
         {"_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", user_time},
         {"_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", user_time},
+        {"_ZN2nn4time25AdjustableUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", user_time},
+        {"_ZN2nn4time25AdjustableUserSystemClock6AdjustEv", adjustable_adjust},
+        {"_ZN2nn4time28AdjustableNetworkSystemClock6AdjustEv", adjustable_adjust},
+        {"_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE", clock_context},
+        {"_ZN2nn4time25AdjustableUserSystemClock21GetSystemClockContextEPNS0_18SystemClockContextE", clock_context},
+        {"_ZN2nn4time21GetDeviceLocationNameEPNS0_12LocationNameE", device_location},
+        {"_ZN2nn4time16LoadTimeZoneRuleEPNS0_12TimeZoneRuleERKNS0_12LocationNameE", load_zone_rule},
+        {"_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeERKNS0_12TimeZoneRuleE", calendar_with_rule},
+        {"_ZN2nn4time11ToPosixTimeEPiPNS0_9PosixTimeEiRKNS0_12CalendarTimeERKNS0_12TimeZoneRuleE", posix_with_rule},
         {"_ZN2nn4time19StandardSteadyClock3nowEv", steady_clock_now},
         {"_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE", to_calendar},
         {"_ZN2nn4time19ToCalendarTimeInUtcERKNS0_9PosixTimeE", to_calendar_utc},
         {"_ZN2nn4time18ToPosixTimeFromUtcERKNS0_12CalendarTimeE", to_posix_utc},
         {"_ZN2nn4time13ClockSnapshotC1Ev", snapshot_init},
         {"_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", snapshot_create},
+        {"_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_", snapshot_create},
+        {"_ZNK2nn4time13ClockSnapshot33GetStandardUserSystemClockContextEv", snapshot_context},
+        {"_ZNK2nn4time13ClockSnapshot35GetStandardUserSystemClockPosixTimeEv", snapshot_posix},
+        {"_ZNK2nn4time13ClockSnapshot38GetStandardUserSystemClockCalendarTimeEv", snapshot_calendar},
         {"_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", span_between},
         {"_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", user_difference},
     };

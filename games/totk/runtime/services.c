@@ -1,5 +1,8 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
+#ifndef NATIVE_APPLICATION_ID
+#define NATIVE_APPLICATION_ID 0x0100f2c0115b6000ULL
+#endif
 #include <TargetConditionals.h>
 #include "ipc.h"
 #include <mach/mach.h>
@@ -228,6 +231,8 @@ void *runtime_observer(const char *name) {
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
 void *runtime_override(const char *name) {
+ extern void *runtime_title_override(const char *) __attribute__((weak_import));
+ if(runtime_title_override){void *title=runtime_title_override(name);if(title)return title;}
  static const struct {const char *name;void *fn;} entries[]={
   {"_ZN2nn2oe18GetDesiredLanguageEv",desired_language},
   {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi",performance_config},
@@ -268,7 +273,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   case 11:arc4random_buf(&value,8);break;
   case 12:value=ASLR_START;break;case 13:value=ASLR_SIZE;break;
   case 14:value=STACK_START;break;case 15:value=STACK_SIZE;break;
-  case 16:value=SYSTEM_RESOURCE_BUDGET;break;case 17:value=sizeof(stack_maps)+sizeof(alias_pages);break;case 18:value=0x0100f2c0115b6000ULL;break;
+  case 16:value=SYSTEM_RESOURCE_BUDGET;break;case 17:value=sizeof(stack_maps)+sizeof(alias_pages);break;case 18:value=NATIVE_APPLICATION_ID;break;
   case 20:value=(uintptr_t)user_exception_context;break;   /* UserExceptionContextAddress: SDK stores e.g. the dying-message region at +0x1c0 */case 23:value=1;break;
   /* AliasRegionExtraSize (18.0.0+): our alias reservation contains no
    * kernel-owned extension outside the range reported by ids 2 and 3. */

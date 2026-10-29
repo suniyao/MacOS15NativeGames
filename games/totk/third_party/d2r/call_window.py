@@ -21,6 +21,14 @@ def branch(source, target):
 
 
 def movable_store(word, address):
+    # Tomodachi's main+0x3fd8c prepares x0 with MOV x0,x22. A plain
+    # register move can be replayed unchanged before borrowing scratch/LR.
+    # Reject virtual x18 and SP/XZR destinations; no PC-relative operands,
+    # memory accesses, flag changes or stack-pointer changes are introduced.
+    if word & 0xffe0ffe0 == 0xaa0003e0:
+        destination, source = word & 31, (word >> 16) & 31
+        if destination not in (18, 31) and source != 18:
+            return
     decoder = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
     decoder.detail = True
     ins = next(decoder.disasm(struct.pack('<I', word), address), None)

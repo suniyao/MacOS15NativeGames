@@ -50,7 +50,10 @@ static class SwshXlate
         public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 32;
-        public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
+        // A user constant buffer holds up to 64 KiB of eight-byte NVN handles.
+        // A fixed 32-entry limit clamps Tomodachi's per-material records to
+        // an unrelated texture (its first dynamic lookup already uses index 34).
+        public int QueryTextureArrayLengthFromBuffer(int slot) => 65536 / 8;
         public int QueryTextureArrayLengthFromPool() => 32;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
